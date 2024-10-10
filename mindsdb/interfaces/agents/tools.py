@@ -40,7 +40,11 @@ def _build_retrieval_tool(tool: dict, pred_args: dict, skill: db.Skills):
         if not kb:
             raise ValueError(f"Knowledge base not found: {kb_name}")
 
-        rag_params['vector_store_config'] = _build_vector_store_config_from_knowledge_base(rag_params, kb, executor)
+        kb_table = executor.session.kb_controller.get_table(kb.name, kb.project_id)
+
+        rag_params['vector_store_config'] = {
+            'kb_table': kb_table
+        }
 
     # Can run into weird validation errors when unpacking rag_params directly into constructor.
     rag_config = RAGPipelineModel(
@@ -123,7 +127,13 @@ def _build_vector_store_config_from_knowledge_base(rag_params: Dict, knowledge_b
     elif vector_store_type == VectorStoreType.PGVECTOR.value:
         # For pgvector, we get connection string
         # todo requires further testing
-        connection_params = knowledge_base.vector_database.data
+
+        # get pgvector runtime data
+        kb_table = executor.session.kb_controller.get_table(knowledge_base.name, knowledge_base.project_id)
+        vector_db = kb_table.get_vector_db()
+        connection_params = vector_db.connection_args
+        vector_store_config['collection_name'] = vector_db._check_table(knowledge_base.vector_database_table)
+
         vector_store_config['connection_string'] = _create_conn_string(connection_params)
 
     else:

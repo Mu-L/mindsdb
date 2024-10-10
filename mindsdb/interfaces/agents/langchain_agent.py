@@ -22,6 +22,7 @@ from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import Tool
 from langfuse import Langfuse
+from langfuse.api.resources.commons.errors.not_found_error import NotFoundError as TraceNotFoundError
 from langfuse.callback import CallbackHandler
 
 from mindsdb.integrations.handlers.openai_handler.constants import (
@@ -38,13 +39,16 @@ from mindsdb.interfaces.storage import db
 
 from .mindsdb_chat_model import ChatMindsdb
 from .callback_handlers import LogCallbackHandler, ContextCaptureCallback
-from .langfuse_callback_handler import LangfuseCallbackHandler, get_metadata, get_tags
+from .langfuse_callback_handler import LangfuseCallbackHandler, get_metadata, get_tags, get_tool_usage, get_skills
+
 from .tools import _build_retrieval_tool
 from .safe_output_parser import SafeOutputParser
+
 
 from .constants import (
     DEFAULT_AGENT_TIMEOUT_SECONDS,
     DEFAULT_AGENT_TYPE,
+    DEFAULT_EMBEDDINGS_MODEL_PROVIDER,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_TOKENS,
     SUPPORTED_PROVIDERS,
@@ -87,7 +91,11 @@ def get_embedding_model_provider(args: Dict) -> str:
         logger.warning(
             "No embedding model provider specified. trying to use llm provider."
         )
-        return args.get("embedding_model_provider", get_llm_provider(args))
+        llm_provider = get_llm_provider(args)
+        if llm_provider == 'mindsdb':
+            # We aren't an embeddings provider, so use the default instead.
+            llm_provider = DEFAULT_EMBEDDINGS_MODEL_PROVIDER
+        return args.get("embedding_model_provider", llm_provider)
     raise ValueError("Invalid model name. Please define provider")
 
 
@@ -188,6 +196,15 @@ class LangchainAgent:
             "embedding_model", get_embedding_model_provider(args)
         )
 
+        self.langfuse = None
+        if os.getenv('LANGFUSE_PUBLIC_KEY') is not None:
+            self.langfuse = Langfuse(
+                public_key=os.getenv('LANGFUSE_PUBLIC_KEY'),
+                secret_key=os.getenv('LANGFUSE_SECRET_KEY'),
+                host=os.getenv('LANGFUSE_HOST'),
+                release=os.getenv('LANGFUSE_RELEASE', 'local'),
+            )
+
         # agent is using current langchain model
         if agent.provider == "mindsdb":
             args["model_name"] = agent.model_name
@@ -217,11 +234,42 @@ class LangchainAgent:
             None  # custom (see langfuse_callback_handler.py)
         )
 
-    def get_completion(self, messages, trace_id, observation_id, stream: bool = False):
+    def get_completion(self, messages, stream: bool = False):
+
+        self.run_completion_span = None
+        self.api_trace = None
+        if self.langfuse:
+
+            # todo we need to fix this as this assumes that the model is always langchain
+            # since decoupling the model from langchain, we need to find a way to get the model name
+            # this breaks retrieval agents
+
+            # metadata retrieval
+            trace_metadata = {
+                'provider': self.args["provider"],
+                'model_name': self.args["model_name"],
+                'embedding_model_provider': self.args.get('embedding_model_provider', get_embedding_model_provider(self.args))
+            }
+            trace_metadata['skills'] = get_skills(self.agent)
+            trace_tags = get_tags(trace_metadata)
+
+            self.api_trace = self.langfuse.trace(
+                name='api-completion',
+                input=messages,
+                tags=trace_tags,
+                metadata=trace_metadata
+            )
+
+            self.run_completion_span = self.api_trace.span(name='run-completion', input=messages)
+            trace_id = self.api_trace.id
+            observation_id = self.run_completion_span.id
+
+            self.trace_id = trace_id
+            self.observation_id = observation_id
+            logger.info(f"Langfuse trace created with ID: {trace_id}")
+
         if stream:
-            return self._get_completion_stream(messages, trace_id, observation_id)
-        self.trace_id = trace_id
-        self.observation_id = observation_id
+            return self._get_completion_stream(messages)
 
         args = self.args
 
@@ -235,10 +283,27 @@ class LangchainAgent:
         # Use last message as prompt, remove other questions.
         user_column = args.get("user_column", USER_COLUMN)
         df.iloc[:-1, df.columns.get_loc(user_column)] = None
-        return self.run_agent(df, agent, args)
+        response = self.run_agent(df, agent, args)
+
+        if self.run_completion_span is not None and self.api_trace is not None:
+            self.run_completion_span.end(output=response)
+            self.api_trace.update(output=response)
+
+            # update metadata with tool usage
+            try:
+                # Ensure all batched traces are sent before fetching.
+                self.langfuse.flush()
+                trace = self.langfuse.get_trace(self.trace_id)
+                trace_metadata['tool_usage'] = get_tool_usage(trace)
+                self.api_trace.update(metadata=trace_metadata)
+            except TraceNotFoundError:
+                logger.warning(f'Langfuse trace {self.trace_id} not found')
+            except Exception as e:
+                logger.error(f'Something went wrong while processing Langfuse trace {self.trace_id}: {str(e)}')
+        return response
 
     def _get_completion_stream(
-        self, messages: List[dict], trace_id: str, observation_id: str
+        self, messages: List[dict]
     ) -> Iterable[Dict]:
         """
         Gets a completion as a stream of chunks from given messages.
@@ -251,8 +316,6 @@ class LangchainAgent:
         Returns:
             chunks (Iterable[object]): Completion chunks
         """
-        self.trace_id = trace_id
-        self.observation_id = observation_id
 
         args = self.args
 
@@ -411,10 +474,14 @@ class LangchainAgent:
                     tags=get_tags(metadata),
                     metadata=metadata,
                 )
-                if not self.langfuse_callback_handler.auth_check():
-                    logger.error(
-                        f"Incorrect Langfuse credentials provided to Langchain handler. Full args: {args}"
-                    )
+                try:
+                    # This try is critical to catch fatal errors which would otherwise prevent the agent from running properly
+                    if not self.langfuse_callback_handler.auth_check():
+                        logger.error(
+                            f"Incorrect Langfuse credentials provided to Langchain handler. Full args: {args}"
+                        )
+                except Exception as e:
+                    logger.error(f'Something went wrong while running langfuse_callback_handler.auth_check {str(e)}')
 
             # custom tracer
             if self.mdb_langfuse_callback_handler is None:
@@ -558,6 +625,15 @@ AI: {response}"""
             captured_context = context_callback.get_contexts()
             if captured_context:
                 yield {"type": "context", "content": captured_context}
+
+        if self.log_callback_handler.generated_sql:
+            # Yield generated SQL if available
+            yield {"type": "sql", "content": self.log_callback_handler.generated_sql}
+
+        if self.run_completion_span is not None:
+            self.run_completion_span.end()
+            self.api_trace.update()
+            logger.info("Langfuse trace updated")
 
     @staticmethod
     def process_chunk(chunk):
